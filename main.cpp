@@ -8,6 +8,9 @@
 #include <iostream>
 #include <vector>
 
+// Value to rebase binary by
+uint64_t rebase;
+
 uint32_t readMagic(FILE* file, off_t offset)
 {
     uint32_t magic;
@@ -66,7 +69,7 @@ std::vector<T*> dumpSections(FILE* file, off_t offset, int nsects)
     {
         T* sect = (T*)loadBytes(file, sectionOffset, sectSize);
         sectionOffset += sectSize;
-        std::cout << sect->segname << "." << sect->sectname << " : 0x" << std::hex << sect->offset << std::endl;
+        std::cout << sect->segname << "." << sect->sectname << " : 0x" << std::hex << sect->offset << " : 0x" << std::hex << sect->addr << " rebased: 0x" << std::hex << (sect->addr - rebase) << std::endl;
         ret.push_back(sect);
     }
     return ret;
@@ -81,6 +84,11 @@ void dumpSegmentCommands(FILE* file, off_t offset, bool isSwap, uint32_t ncmds)
         if (command->cmd == LC_SEGMENT_64)
         {
             segment_command_64* segment = (segment_command_64*)loadBytes(file, actualOffset, sizeof(segment_command_64));
+            if (std::string(segment->segname) == "__PAGEZERO")
+            {
+                rebase = segment->vmsize;
+            }
+            std::cout << "A- 0x" << std::hex << segment->vmsize << std::endl;
             uint32_t sectionOffset = actualOffset + sizeof(segment_command_64);
 
             std::cout << segment->segname << std::endl;
@@ -88,8 +96,13 @@ void dumpSegmentCommands(FILE* file, off_t offset, bool isSwap, uint32_t ncmds)
         }
         else if (command->cmd == LC_SEGMENT)
         {
-            segment_command_64* segment = (segment_command_64*)loadBytes(file, actualOffset, sizeof(segment_command_64));
-            uint32_t sectionOffset = actualOffset + sizeof(segment_command_64);
+            segment_command* segment = (segment_command*)loadBytes(file, actualOffset, sizeof(segment_command));
+            if (std::string(segment->segname) == "__PAGEZERO")
+            {
+                rebase = segment->vmsize;
+            }
+
+            uint32_t sectionOffset = actualOffset + sizeof(segment_command);
 
             std::cout << segment->segname << std::endl;
             std::vector<section*> sects = dumpSections<section>(file, sectionOffset, (int)segment->nsects);
