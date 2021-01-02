@@ -7,9 +7,8 @@
 #include <mach-o/fat.h>
 #include <iostream>
 #include <vector>
-
-// Value to rebase binary by
-uint64_t rebase;
+#include <iterator>
+#include <algorithm>
 
 uint32_t readMagic(FILE* file, off_t offset)
 {
@@ -69,78 +68,117 @@ std::vector<T*> dumpSections(FILE* file, off_t offset, int nsects)
     {
         T* sect = (T*)loadBytes(file, sectionOffset, sectSize);
         sectionOffset += sectSize;
-        std::cout << sect->segname << "." << sect->sectname << " : 0x" << std::hex << sect->offset << " : 0x" << std::hex << sect->addr << " rebased: 0x" << std::hex << (sect->addr - rebase) << std::endl;
         ret.push_back(sect);
     }
     return ret;
 }
 
-void dumpSegmentCommands(FILE* file, off_t offset, bool isSwap, uint32_t ncmds)
+template<typename T, typename S>
+struct _segments {
+    bool is64;
+    uint64_t rebase;
+
+    std::vector<T*> segments;
+    std::vector<S*> sections;
+};
+
+template<typename A, typename T>
+_segments<A, T> dumpSegmentCommands(FILE* file, off_t offset, int ncmds)
 {
+    _segments<A, T> ret;
+
+    ret.is64 = typeid(T) == typeid(section_64);
+
     off_t actualOffset = offset;
-    for (uint32_t i = 0U; i < ncmds; i++)
+    for (int i = 0; i < ncmds; i++)
     {
         load_command* command = (load_command*)loadBytes(file, actualOffset, sizeof(load_command));
         if (command->cmd == LC_SEGMENT_64)
         {
-            segment_command_64* segment = (segment_command_64*)loadBytes(file, actualOffset, sizeof(segment_command_64));
+            A* segment = (A*)loadBytes(file, actualOffset, sizeof(A));
+            ret.segments.push_back(segment);
+
             if (std::string(segment->segname) == "__PAGEZERO")
             {
-                rebase = segment->vmsize;
+                ret.rebase = segment->vmsize;
             }
-            std::cout << "A- 0x" << std::hex << segment->vmsize << std::endl;
-            uint32_t sectionOffset = actualOffset + sizeof(segment_command_64);
+            uint32_t sectionOffset = actualOffset + sizeof(A);
 
             std::cout << segment->segname << std::endl;
-            std::vector<section_64*> sects = dumpSections<section_64>(file, sectionOffset, (int)segment->nsects);
+            std::vector<T*> sects = dumpSections<T>(file, sectionOffset, (int)segment->nsects);
+            std::copy(sects.begin(), sects.end(), back_inserter(ret.sections));
         }
-        else if (command->cmd == LC_SEGMENT)
-        {
-            segment_command* segment = (segment_command*)loadBytes(file, actualOffset, sizeof(segment_command));
-            if (std::string(segment->segname) == "__PAGEZERO")
-            {
-                rebase = segment->vmsize;
-            }
-
-            uint32_t sectionOffset = actualOffset + sizeof(segment_command);
-
-            std::cout << segment->segname << std::endl;
-            std::vector<section*> sects = dumpSections<section>(file, sectionOffset, (int)segment->nsects);
-        }
-
         actualOffset += command->cmdsize;
     }
+    return ret;
 }
 
-void dumpMachHeader(FILE* file, off_t offset, bool is64, bool isSwap)
+template<typename H, typename A, typename T>
+struct _header
 {
-    uint32_t ncmds;
+    H* header;
+    _segments<A, T> segments;
+    const char* CPUName;
+};
+
+template<typename H, typename A, typename T>
+_header<H, A, T> dumpMachHeader(FILE* file, off_t offset, bool isSwap)
+{
+    _header<H, A, T> ret;
     off_t loadCommandsOffset = offset;
-    if (is64)
+    size_t headerSize = sizeof(H);
+    H* header = (H*)loadBytes(file, offset, headerSize);
+    if (isSwap && typeid(H) == typeid(mach_header))
     {
-        size_t headerSize = sizeof(mach_header_64);
-        mach_header_64* header = (mach_header_64*)loadBytes(file, offset, headerSize);
-        if (isSwap)
-        {
-            swap_mach_header_64(header, NX_UnknownByteOrder);
-        }
-        std::cout << getCPUName(header->cputype) << std::endl;
-        loadCommandsOffset += headerSize;
-        ncmds = header->ncmds;
+        swap_mach_header((mach_header*)header, NX_UnknownByteOrder);
     }
-    else {
-        size_t headerSize = sizeof(mach_header);
-        mach_header* header = (mach_header*)loadBytes(file, offset, headerSize);
-        if (isSwap)
-        {
-            swap_mach_header(header, NX_UnknownByteOrder);
-        }
-        std::cout << getCPUName(header->cputype) << std::endl;
-        loadCommandsOffset += headerSize;
-        ncmds = header->ncmds;
+    else if (isSwap && typeid(H) == typeid(mach_header_64))
+    {
+        swap_mach_header_64((mach_header_64*)header, NX_UnknownByteOrder);
     }
 
-    dumpSegmentCommands(file, loadCommandsOffset, isSwap, ncmds);
+    loadCommandsOffset += headerSize;
+
+    ret.header = header;
+    ret.CPUName = getCPUName(header->cputype);
+    ret.segments = dumpSegmentCommands<A, T>(file, loadCommandsOffset, header->ncmds);
+
+    return ret;
+}
+
+
+template<typename H, typename A, typename T>
+_header<H, A, T> dumpFatArch(FILE* file, bool isSwap, cpu_type_t cpu)
+{
+    size_t header_size = sizeof(fat_header);
+    size_t archSize = sizeof(fat_arch);
+    fat_header* header = (fat_header*)loadBytes(file, 0, header_size);
+    if (isSwap)
+    {
+        swap_fat_header(header, NX_UnknownByteOrder);
+    }
+
+    off_t archOffset = (off_t)header_size;
+    for (uint32_t i = 0U; i < header->nfat_arch; i++)
+    {
+        fat_arch* arch = (fat_arch*)loadBytes(file, archOffset, archSize);
+        if (isSwap)
+        {
+            swap_fat_arch(arch, 1, NX_UnknownByteOrder);
+        }
+
+        off_t machHeaderOffset = (off_t)arch->offset;
+        archOffset += archSize;
+
+        uint32_t magic = readMagic(file, machHeaderOffset);
+        bool is64 = isMagic64(magic);
+        bool isSwap = shouldSwapBytes(magic);
+
+        if (arch->cputype == cpu)
+        {
+            return dumpMachHeader<H, A, T>(file, machHeaderOffset, isSwap);
+        }
+    }
 }
 
 void dumpFatMachHeader(FILE* file, bool isSwap)
@@ -168,7 +206,19 @@ void dumpFatMachHeader(FILE* file, bool isSwap)
         uint32_t magic = readMagic(file, machHeaderOffset);
         bool is64 = isMagic64(magic);
         bool isSwap = shouldSwapBytes(magic);
-        dumpMachHeader(file, machHeaderOffset, is64, isSwap);
+
+        if (is64)
+        {
+            _header<mach_header_64, segment_command_64, section_64> a = dumpMachHeader<mach_header_64, segment_command_64, section_64>(file, machHeaderOffset, isSwap);
+            for (section_64* sect : a.segments.sections)
+            {
+                std::cout << sect->segname << "." << sect->sectname << std::endl;
+            }
+        }
+        else
+        {
+            _header<mach_header, segment_command, section> a = dumpMachHeader<mach_header, segment_command, section>(file, machHeaderOffset, isSwap);
+        }
     }
 }
 
@@ -185,13 +235,29 @@ void dumpSegments(FILE* file)
     }
     else
     {
-        dumpMachHeader(file, 0, is64, swap);
+        if (is64)
+        {
+            _header<mach_header_64, segment_command_64, section_64> a = dumpMachHeader<mach_header_64, segment_command_64, section_64>(file, 0, swap);
+        }
+        else
+        {
+            _header<mach_header, segment_command, section> a = dumpMachHeader<mach_header, segment_command, section>(file, 0, swap);
+        }
     }
 }
 
 int main()
 {
     FILE* file = fopen("wow", "rb");
-    std::cout << file << std::endl;
-    dumpSegments(file);
+
+    uint32_t magic = readMagic(file, 0);
+    bool swap = shouldSwapBytes(magic);
+
+    _header<mach_header_64, segment_command_64, section_64> a = dumpFatArch<mach_header_64, segment_command_64, section_64>(file, swap, CPU_TYPE_X86_64);
+    for (section_64* sect : a.segments.sections)
+    {
+        std::cout << sect->segname << "." << sect->sectname << " offset: 0x" << std::hex << sect->addr - a.segments.rebase << std::endl;
+    }
+
+    // dumpSegments(file);
 }
